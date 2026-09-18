@@ -1,6 +1,6 @@
 # Self-hosted Bluesky video service
 
-This Cloudflare Worker accepts `app.bsky.video` uploads, stores the source in R2, transcodes it through Cloudflare Stream for HLS playback, uploads the original asynchronously to the user's PDS, and returns the ATProto blob reference for use in an `app.bsky.embed.video` post.
+This Cloudflare Worker accepts `app.bsky.video` uploads, stores the source in R2, uploads the original asynchronously to the user's PDS, and returns the ATProto blob reference for use in an `app.bsky.embed.video` post.
 
 ## Setup
 
@@ -24,13 +24,6 @@ This Cloudflare Worker accepts `app.bsky.video` uploads, stores the source in R2
    npm run deploy
    ```
 
-5. Configure the Cloudflare Stream API credentials used by background processing:
-
-   ```sh
-   npx wrangler secret put CF_ACCOUNT_ID
-   npx wrangler secret put CF_STREAM_TOKEN
-   ```
-
 ## Endpoints
 
 - `GET /xrpc/app.bsky.video.getUploadLimits`
@@ -38,7 +31,7 @@ This Cloudflare Worker accepts `app.bsky.video` uploads, stores the source in R2
 - `GET /xrpc/app.bsky.video.getJobStatus?jobId=...`
 - `GET /watch/:did/:blobCid/playlist.m3u8`
 
-All endpoints require an ATProto service-auth bearer token targeted at `SERVICE_DID`. Job status is restricted to the DID that created the job. Uploads are limited by `MAX_FILE_SIZE_BYTES` and `DAILY_LIMIT_PER_USER`.
+All XRPC endpoints require an ATProto service-auth bearer token targeted at `SERVICE_DID`. Job status is restricted to the DID that created the job. Uploads are limited by `MAX_FILE_SIZE_BYTES` and `DAILY_LIMIT_PER_USER`. Legacy `/watch/.../playlist.m3u8` requests first try Bluesky's public video CDN, then fall back to the uploader's PDS blob as `/video.mp4`; no Cloudflare API authentication is used. A plain MP4 cannot be served as a true HLS playlist without a transcoder.
 
 ## Local checks
 

@@ -1,7 +1,6 @@
 import { serviceAuthAudience, tokenFromAuthorization, verifyServiceToken } from './auth';
 import { resolvePdsEndpoint, uploadBlobToPds } from './pds';
 import { storeVideo } from './storage';
-import { uploadVideoToStream } from './stream';
 import type { Env, JobStatusResponse, UploadLimitsResponse, VideoJobRecord } from './types';
 
 const headers = {
@@ -23,9 +22,9 @@ export default {
     const url = new URL(request.url);
 
     try {
-      const watchMatch = url.pathname.match(/^\/watch\/([^/]+)\/([^/]+)\/playlist\.m3u8$/);
-      if (watchMatch && request.method === 'GET') {
-        return await handleWatchRequest(env, decodeURIComponent(watchMatch[1]), watchMatch[2]);
+      const watchMatch = url.pathname.match(/^\/watch\/([^/]+)\/([^/]+)\/(playlist\.m3u8|video\.mp4)$/);
+      if (watchMatch && (request.method === 'GET' || request.method === 'HEAD')) {
+        return await handleWatchRequest(env, request, url.origin, decodeURIComponent(watchMatch[1]), watchMatch[2], watchMatch[3]);
       }
 
       if (url.pathname === '/xrpc/app.bsky.video.getUploadLimits' && request.method === 'GET') {
@@ -35,25 +34,45 @@ export default {
       }
 
 
-async function handleWatchRequest(env: Env, did: string, cid: string): Promise<Response> {
-  const jobs = await env.DB.prepare('SELECT stream_uid, blob_ref FROM video_jobs WHERE did = ? AND state = ?')
-    .bind(did, 'completed')
-    .all<Pick<VideoJobRecord, 'stream_uid' | 'blob_ref'>>();
-  const job = jobs.results.find((candidate) => {
-    if (!candidate.blob_ref) return false;
-    try {
-      const blob = JSON.parse(candidate.blob_ref) as { ref?: { $link?: string } };
-      return blob.ref?.$link === cid;
-    } catch {
-      return false;
+async function handleWatchRequest(env: Env, request: Request, origin: string, did: string, cid: string, format: string): Promise<Response> {
+  // Videos created before this service became the CDN live on Bluesky's public video CDN.
+  // Redirecting preserves the manifest's relative segment URLs and requires no Cloudflare auth.
+  const legacyUrl = `https://video.cdn.bsky.app/watch/${encodeURIComponent(did)}/${encodeURIComponent(cid)}/playlist.m3u8`;
+  if (format === 'playlist.m3u8') {
+    const legacyResponse = await fetch(legacyUrl, { redirect: 'manual' });
+    if (legacyResponse.status >= 200 && legacyResponse.status < 400) {
+      return Response.redirect(legacyUrl, 302);
     }
-  });
-
-  if (!job || !job.stream_uid || job.stream_uid.startsWith('videos/')) {
-    return json({ error: 'VideoPlaybackNotFound' }, 404);
   }
 
-  return Response.redirect(`https://videodelivery.net/${encodeURIComponent(job.stream_uid)}/manifest/video.m3u8`, 302);
+  const pdsEndpoint = await resolvePdsEndpoint(did);
+  const blobUrl = new URL(`${pdsEndpoint}/xrpc/com.atproto.sync.getBlob`);
+  blobUrl.searchParams.set('did', did);
+  blobUrl.searchParams.set('cid', cid);
+  if (format === 'playlist.m3u8') {
+    return Response.redirect(`${origin}${urlForCurrentHost(did, cid)}/video.mp4`, 302);
+  }
+
+  const blobResponse = await fetch(blobUrl, {
+    method: 'GET',
+    headers: request.headers.get('Range') ? { Range: request.headers.get('Range')! } : undefined,
+  });
+  if (!blobResponse.ok) return json({ error: 'VideoPlaybackNotFound' }, 404);
+  return new Response(blobResponse.body, {
+    status: blobResponse.status,
+    headers: {
+      ...headers,
+      'Content-Type': blobResponse.headers.get('Content-Type') || 'video/mp4',
+      'Cache-Control': 'public, max-age=31536000, immutable',
+      ...(blobResponse.headers.get('Content-Length') ? { 'Content-Length': blobResponse.headers.get('Content-Length')! } : {}),
+      ...(blobResponse.headers.get('Content-Range') ? { 'Content-Range': blobResponse.headers.get('Content-Range')! } : {}),
+      ...(blobResponse.headers.get('Accept-Ranges') ? { 'Accept-Ranges': blobResponse.headers.get('Accept-Ranges')! } : { 'Accept-Ranges': 'bytes' }),
+    },
+  });
+}
+
+function urlForCurrentHost(did: string, cid: string): string {
+  return `/watch/${encodeURIComponent(did)}/${encodeURIComponent(cid)}`;
 }
       if (url.pathname === '/xrpc/app.bsky.video.uploadVideo' && request.method === 'POST') {
         const authorization = request.headers.get('Authorization');
@@ -112,10 +131,7 @@ async function processVideoJob(env: Env, jobId: string, did: string, key: string
   try {
     const object = await env.RAW_STORAGE.get(key);
     if (!object) throw new Error('Video object missing from R2 storage');
-    const videoBytes = await object.arrayBuffer();
-    const streamUid = await uploadVideoToStream(env, videoBytes, contentType);
-    await env.DB.prepare('UPDATE video_jobs SET stream_uid = ?, progress = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?').bind(streamUid, 60, jobId).run();
-    const blob = await uploadBlobToPds(await resolvePdsEndpoint(did), token, videoBytes, contentType);
+    const blob = await uploadBlobToPds(await resolvePdsEndpoint(did), token, await object.arrayBuffer(), contentType);
     await env.DB.prepare('UPDATE video_jobs SET state = ?, progress = ?, blob_ref = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?').bind('completed', 100, JSON.stringify(blob), jobId).run();
   } catch (error) {
     const message = error instanceof Error ? error.message : 'ProcessingFailed';
