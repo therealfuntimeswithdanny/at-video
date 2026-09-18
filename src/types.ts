@@ -1,9 +1,6 @@
 export interface Env {
   DB: D1Database;
   RAW_STORAGE: R2Bucket;
-  CF_ACCOUNT_ID: string;
-  CF_STREAM_TOKEN: string;
-  STREAM_WEBHOOK_SECRET: string;
   SERVICE_DID: string;
   SERVICE_DOMAIN: string;
   MAX_FILE_SIZE_BYTES: number;

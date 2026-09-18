@@ -24,13 +24,6 @@ This Cloudflare Worker accepts `app.bsky.video` uploads, stores the source in R2
    npm run deploy
    ```
 
-5. Configure Cloudflare Stream credentials for server-side ingestion. Playback itself remains public and requires no Cloudflare authentication:
-
-   ```sh
-   npx wrangler secret put CF_ACCOUNT_ID
-   npx wrangler secret put CF_STREAM_TOKEN
-   ```
-
 ## Endpoints
 
 - `GET /xrpc/app.bsky.video.getUploadLimits`
@@ -39,7 +32,7 @@ This Cloudflare Worker accepts `app.bsky.video` uploads, stores the source in R2
 - `GET /watch/:did/:blobCid/playlist.m3u8`
 - `GET /watch/:did/:blobCid/thumbnail.jpg` when the thumbnail exists on the legacy video CDN
 
-All XRPC endpoints require an ATProto service-auth bearer token targeted at `SERVICE_DID`. Job status is restricted to the DID that created the job. Uploads are limited by `MAX_FILE_SIZE_BYTES` and `DAILY_LIMIT_PER_USER`. Legacy `/watch/.../playlist.m3u8` requests first try Bluesky's public video CDN, then lazily ingest the PDS MP4 into Cloudflare Stream and redirect to a real HLS manifest. Stream thumbnails are served from the same public delivery URL; playback requires no Cloudflare authentication.
+All XRPC endpoints require an ATProto service-auth bearer token targeted at `SERVICE_DID`. Job status is restricted to the DID that created the job. Uploads are limited by `MAX_FILE_SIZE_BYTES` and `DAILY_LIMIT_PER_USER`. `/watch/.../playlist.m3u8` redirects to the matching `/video.mp4` URL, allowing the existing client URL to resolve without a paid transcoding service.
 
 ## Local checks
 
