@@ -28,5 +28,10 @@
 "SERVICE_DOMAIN": "video.madebydanny.uk",
 "MAX_FILE_SIZE_BYTES": 104857600,
 "DAILY_LIMIT_PER_USER": 10
-}
+},
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+
 }
