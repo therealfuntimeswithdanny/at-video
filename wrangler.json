@@ -1,0 +1,32 @@
+{
+"$schema": "node_modules/wrangler/config-schema.json",
+"name": "bsky-video-service",
+"main": "src/index.ts",
+"compatibility_date": "2024-09-25",
+"compatibility_flags": ["nodejs_compat"],
+"routes": [
+{
+"pattern": "video.yourdomain.com/*",
+"custom_domain": true
+}
+],
+"d1_databases": [
+{
+"binding": "DB",
+"database_name": "bsky-video-db",
+"database_id": "4c382c58-3221-476f-ac3b-448237f1cc90"
+}
+],
+"r2_buckets": [
+{
+"binding": "RAW_STORAGE",
+"bucket_name": "bsky-video"
+}
+],
+"vars": {
+"SERVICE_DID": "did:web:video.madebydanny.uk",
+"SERVICE_DOMAIN": "video.madebydanny.uk",
+"MAX_FILE_SIZE_BYTES": 104857600,
+"DAILY_LIMIT_PER_USER": 10
+}
+}
