@@ -1,6 +1,7 @@
 import { serviceAuthAudience, tokenFromAuthorization, verifyServiceToken } from './auth';
 import { resolvePdsEndpoint, uploadBlobToPds } from './pds';
 import { storeVideo } from './storage';
+import { streamManifestUrl, streamThumbnailUrl, uploadVideoToStream } from './stream';
 import type { Env, JobStatusResponse, UploadLimitsResponse, VideoJobRecord } from './types';
 
 const headers = {
@@ -22,9 +23,9 @@ export default {
     const url = new URL(request.url);
 
     try {
-      const watchMatch = url.pathname.match(/^\/watch\/([^/]+)\/([^/]+)\/(playlist\.m3u8|video\.mp4)$/);
+      const watchMatch = url.pathname.match(/^\/watch\/([^/]+)\/([^/]+)\/(playlist\.m3u8|video\.mp4|thumbnail\.jpg)$/);
       if (watchMatch && (request.method === 'GET' || request.method === 'HEAD')) {
-        return await handleWatchRequest(env, request, url.origin, decodeURIComponent(watchMatch[1]), watchMatch[2], watchMatch[3]);
+        return await handleWatchRequest(env, request, decodeURIComponent(watchMatch[1]), watchMatch[2], watchMatch[3]);
       }
 
       if (url.pathname === '/xrpc/app.bsky.video.getUploadLimits' && request.method === 'GET') {
@@ -34,15 +35,20 @@ export default {
       }
 
 
-async function handleWatchRequest(env: Env, request: Request, origin: string, did: string, cid: string, format: string): Promise<Response> {
+async function handleWatchRequest(env: Env, request: Request, did: string, cid: string, format: string): Promise<Response> {
   // Videos created before this service became the CDN live on Bluesky's public video CDN.
   // Redirecting preserves the manifest's relative segment URLs and requires no Cloudflare auth.
-  const legacyUrl = `https://video.cdn.bsky.app/watch/${encodeURIComponent(did)}/${encodeURIComponent(cid)}/playlist.m3u8`;
-  if (format === 'playlist.m3u8') {
+  const legacyUrl = `https://video.cdn.bsky.app/watch/${encodeURIComponent(did)}/${encodeURIComponent(cid)}/${format}`;
+  if (format === 'playlist.m3u8' || format === 'thumbnail.jpg') {
     const legacyResponse = await fetch(legacyUrl, { redirect: 'manual' });
     if (legacyResponse.status >= 200 && legacyResponse.status < 400) {
       return Response.redirect(legacyUrl, 302);
     }
+  }
+
+  const cachedStreamUid = await findStreamUid(env, did, cid);
+  if (cachedStreamUid) {
+    return Response.redirect(format === 'thumbnail.jpg' ? streamThumbnailUrl(cachedStreamUid) : streamManifestUrl(cachedStreamUid), 302);
   }
 
   const pdsEndpoint = await resolvePdsEndpoint(did);
@@ -50,7 +56,18 @@ async function handleWatchRequest(env: Env, request: Request, origin: string, di
   blobUrl.searchParams.set('did', did);
   blobUrl.searchParams.set('cid', cid);
   if (format === 'playlist.m3u8') {
-    return Response.redirect(`${origin}${urlForCurrentHost(did, cid)}/video.mp4`, 302);
+    const blobResponse = await fetch(blobUrl);
+    if (!blobResponse.ok) return json({ error: 'VideoPlaybackNotFound' }, 404);
+    const streamUid = await uploadVideoToStream(env, await blobResponse.arrayBuffer(), blobResponse.headers.get('Content-Type') || 'video/mp4');
+    await cacheStreamJob(env, did, cid, streamUid);
+    return Response.redirect(streamManifestUrl(streamUid), 302);
+  }
+  if (format === 'thumbnail.jpg') {
+    const blobResponse = await fetch(blobUrl);
+    if (!blobResponse.ok) return json({ error: 'VideoPlaybackNotFound' }, 404);
+    const streamUid = await uploadVideoToStream(env, await blobResponse.arrayBuffer(), blobResponse.headers.get('Content-Type') || 'video/mp4');
+    await cacheStreamJob(env, did, cid, streamUid);
+    return Response.redirect(streamThumbnailUrl(streamUid), 302);
   }
 
   const blobResponse = await fetch(blobUrl, {
@@ -71,8 +88,27 @@ async function handleWatchRequest(env: Env, request: Request, origin: string, di
   });
 }
 
-function urlForCurrentHost(did: string, cid: string): string {
-  return `/watch/${encodeURIComponent(did)}/${encodeURIComponent(cid)}`;
+async function findStreamUid(env: Env, did: string, cid: string): Promise<string | null> {
+  const jobs = await env.DB.prepare('SELECT stream_uid, blob_ref FROM video_jobs WHERE did = ? AND state = ?')
+    .bind(did, 'completed')
+    .all<{ stream_uid: string; blob_ref: string | null }>();
+  for (const job of jobs.results) {
+    if (!job.blob_ref || !job.stream_uid || job.stream_uid.startsWith('videos/')) continue;
+    try {
+      if ((JSON.parse(job.blob_ref) as { ref?: { $link?: string } }).ref?.$link === cid) return job.stream_uid;
+    } catch {
+      // Ignore malformed historical blob references.
+    }
+  }
+  return null;
+}
+
+async function cacheStreamJob(env: Env, did: string, cid: string, streamUid: string) {
+  const jobId = `legacy-${cid}`;
+  const blobRef = JSON.stringify({ $type: 'blob', ref: { $link: cid } });
+  await env.DB.prepare(`INSERT INTO video_jobs (job_id, did, stream_uid, state, progress, service_token, blob_ref) VALUES (?, ?, ?, 'completed', 100, '', ?) ON CONFLICT(job_id) DO UPDATE SET stream_uid = excluded.stream_uid, state = excluded.state, progress = excluded.progress, blob_ref = excluded.blob_ref, updated_at = CURRENT_TIMESTAMP`)
+    .bind(jobId, did, streamUid, blobRef)
+    .run();
 }
       if (url.pathname === '/xrpc/app.bsky.video.uploadVideo' && request.method === 'POST') {
         const authorization = request.headers.get('Authorization');
@@ -131,7 +167,10 @@ async function processVideoJob(env: Env, jobId: string, did: string, key: string
   try {
     const object = await env.RAW_STORAGE.get(key);
     if (!object) throw new Error('Video object missing from R2 storage');
-    const blob = await uploadBlobToPds(await resolvePdsEndpoint(did), token, await object.arrayBuffer(), contentType);
+    const videoBytes = await object.arrayBuffer();
+    const streamUid = await uploadVideoToStream(env, videoBytes, contentType);
+    await env.DB.prepare('UPDATE video_jobs SET stream_uid = ?, progress = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?').bind(streamUid, 60, jobId).run();
+    const blob = await uploadBlobToPds(await resolvePdsEndpoint(did), token, videoBytes, contentType);
     await env.DB.prepare('UPDATE video_jobs SET state = ?, progress = ?, blob_ref = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?').bind('completed', 100, JSON.stringify(blob), jobId).run();
   } catch (error) {
     const message = error instanceof Error ? error.message : 'ProcessingFailed';
