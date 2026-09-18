@@ -1,6 +1,7 @@
 import { serviceAuthAudience, tokenFromAuthorization, verifyServiceToken } from './auth';
 import { resolvePdsEndpoint, uploadBlobToPds } from './pds';
 import { storeVideo } from './storage';
+import { uploadVideoToStream } from './stream';
 import type { Env, JobStatusResponse, UploadLimitsResponse, VideoJobRecord } from './types';
 
 const headers = {
@@ -22,12 +23,38 @@ export default {
     const url = new URL(request.url);
 
     try {
+      const watchMatch = url.pathname.match(/^\/watch\/([^/]+)\/([^/]+)\/playlist\.m3u8$/);
+      if (watchMatch && request.method === 'GET') {
+        return await handleWatchRequest(env, decodeURIComponent(watchMatch[1]), watchMatch[2]);
+      }
+
       if (url.pathname === '/xrpc/app.bsky.video.getUploadLimits' && request.method === 'GET') {
         const did = await verifyServiceToken(request.headers.get('Authorization'), serviceAuthAudience(env));
         const quota = await getQuota(env, did);
         return json(limits(env, quota.videos_today, quota.bytes_today));
       }
 
+
+async function handleWatchRequest(env: Env, did: string, cid: string): Promise<Response> {
+  const jobs = await env.DB.prepare('SELECT stream_uid, blob_ref FROM video_jobs WHERE did = ? AND state = ?')
+    .bind(did, 'completed')
+    .all<Pick<VideoJobRecord, 'stream_uid' | 'blob_ref'>>();
+  const job = jobs.results.find((candidate) => {
+    if (!candidate.blob_ref) return false;
+    try {
+      const blob = JSON.parse(candidate.blob_ref) as { ref?: { $link?: string } };
+      return blob.ref?.$link === cid;
+    } catch {
+      return false;
+    }
+  });
+
+  if (!job || !job.stream_uid || job.stream_uid.startsWith('videos/')) {
+    return json({ error: 'VideoPlaybackNotFound' }, 404);
+  }
+
+  return Response.redirect(`https://videodelivery.net/${encodeURIComponent(job.stream_uid)}/manifest/video.m3u8`, 302);
+}
       if (url.pathname === '/xrpc/app.bsky.video.uploadVideo' && request.method === 'POST') {
         const authorization = request.headers.get('Authorization');
         const did = await verifyServiceToken(authorization, serviceAuthAudience(env));
@@ -85,7 +112,10 @@ async function processVideoJob(env: Env, jobId: string, did: string, key: string
   try {
     const object = await env.RAW_STORAGE.get(key);
     if (!object) throw new Error('Video object missing from R2 storage');
-    const blob = await uploadBlobToPds(await resolvePdsEndpoint(did), token, await object.arrayBuffer(), contentType);
+    const videoBytes = await object.arrayBuffer();
+    const streamUid = await uploadVideoToStream(env, videoBytes, contentType);
+    await env.DB.prepare('UPDATE video_jobs SET stream_uid = ?, progress = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?').bind(streamUid, 60, jobId).run();
+    const blob = await uploadBlobToPds(await resolvePdsEndpoint(did), token, videoBytes, contentType);
     await env.DB.prepare('UPDATE video_jobs SET state = ?, progress = ?, blob_ref = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?').bind('completed', 100, JSON.stringify(blob), jobId).run();
   } catch (error) {
     const message = error instanceof Error ? error.message : 'ProcessingFailed';
